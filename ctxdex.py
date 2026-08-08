@@ -33,6 +33,43 @@ TEXT_EXTS = {
 }
 SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv", "bin", "obj", "dist", "build"}
 
+# --- secret gate (manual ingestion) ------------------------------------------
+# Content is stored as plaintext SQLite, so secret-bearing input is rejected at
+# the door: clear reason, non-zero exit, nothing written. Deliberately no
+# --allow-sensitive escape hatch until a real need appears.
+#
+# ALIGNMENT NOTE: the content patterns are a deliberate duplicate of
+# _OUTPUT_PATTERNS in claude-profile/hooks/ctxdex_autoindex.py (auto-capture's
+# gate). The two policies must stay aligned — change one, change both, and keep
+# their test vectors matching. Duplicated on purpose: this standalone repo must
+# not depend on the hook at runtime.
+SENSITIVE_CONTENT_PATTERNS = [
+    re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA |ENCRYPTED )?PRIVATE KEY-----"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{36,}\b"),
+    re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b"),
+    re.compile(r"\bBearer\s+[A-Za-z0-9\-._~+/]{20,}=*"),
+    re.compile(r"\w+://[^\s/:@]+:[^\s/@]+@"),  # scheme://user:pass@host
+    re.compile(r"(?is)\bserver\s*=.*?;\s*password\s*="),  # ODBC-style connection string
+]
+# Known secret-file names are denied outright regardless of content — a direct
+# file target bypasses the TEXT_EXTS extension filter, so .env / keys / creds
+# need their own gate.
+SENSITIVE_NAME_RE = re.compile(
+    r"^\.env(\..+)?$|^id_(rsa|ed25519|ecdsa|dsa)(\..+)?$|\.(pem|key|pfx|p12|ppk)$|^credentials?(\..+)?$|^\.netrc$|^\.npmrc$|^\.pypirc$",
+    re.I,
+)
+
+
+def sensitive_reason(name: str, text: str) -> str | None:
+    """Why this content must not be persisted, or None if it may be."""
+    if name and SENSITIVE_NAME_RE.search(name):
+        return f"sensitive filename pattern: {name}"
+    for pat in SENSITIVE_CONTENT_PATTERNS:
+        if pat.search(text):
+            return f"content matches sensitive pattern: {pat.pattern[:60]}"
+    return None
+
 
 def db_path(project: str) -> Path:
     safe = re.sub(r"[^a-zA-Z0-9_-]", "_", project)
@@ -158,13 +195,23 @@ def iter_source_files(path: Path):
                 yield fp
 
 
-def cmd_index(args):
+def cmd_index(args) -> int:
+    """Index the target. Returns 0, or 2 when anything was rejected by the
+    secret gate (rejected files are skipped and never written; in a directory
+    run the clean files still index). No sys.exit here — the auto-capture hook
+    calls this in-process and must be able to fail open."""
     conn = connect(args.project)
     total_chunks = 0
     total_files = 0
+    rejected = 0
 
     if args.target.startswith(("http://", "https://")):
         text = fetch_url(args.target)
+        reason = sensitive_reason("", text)
+        if reason:
+            print(f"refused: {reason} ({args.target}) - nothing indexed", file=sys.stderr)
+            conn.close()
+            return 2
         source = args.source or "web"
         chunks = chunk_text(text, args.target)
         for title, body in chunks:
@@ -185,6 +232,11 @@ def cmd_index(args):
                 text = fp.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 continue
+            reason = sensitive_reason(fp.name, text)
+            if reason:
+                print(f"refused: {reason} ({fp}) - not indexed", file=sys.stderr)
+                rejected += 1
+                continue
             chunks = chunk_text(text, fp.name)
             stored_path = args.path or str(fp)
             for title, body in chunks:
@@ -198,6 +250,10 @@ def cmd_index(args):
     conn.commit()
     conn.close()
     print(f"indexed {total_files} file(s), {total_chunks} chunk(s) -> project '{args.project}', source '{args.source or ('web' if args.target.startswith('http') else 'local')}'")
+    if rejected:
+        print(f"refused {rejected} file(s) by the secret gate - see reasons above", file=sys.stderr)
+        return 2
+    return 0
 
 
 def _rrf_merge(porter_hits: list[tuple[int, float]], trigram_hits: list[tuple[int, float]], k: int = 60) -> list[int]:
@@ -378,7 +434,7 @@ def main():
     args = parser.parse_args()
     if getattr(args, "project", None) is None:
         args.project = default_project()
-    args.func(args)
+    sys.exit(args.func(args) or 0)
 
 
 if __name__ == "__main__":
